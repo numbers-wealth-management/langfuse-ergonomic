@@ -169,7 +169,7 @@ pub use batcher::{
 };
 pub use client::{ClientBuilder, LangfuseClient};
 pub use error::{Error, EventError, IngestionResponse, Result};
-pub use traces::{IdGenerator, TraceResponse};
+pub use traces::{GenerationUsageDetails, IdGenerator, TraceResponse};
 
 // Re-export types from langfuse-client-base for convenience
 //
@@ -193,7 +193,7 @@ pub use traces::{IdGenerator, TraceResponse};
 // - Utility types: ScoreDataType
 pub use langfuse_client_base::models::{
     CreateEventBody, CreateGenerationBody, CreateSpanBody, Dataset, DatasetItem,
-    DatasetRunWithItems, IngestionBatchRequest, IngestionEvent, LegacyObservationsViews,
+    DatasetRunWithItems, IngestionBatchRequest, IngestionEvent, LegacyObservationsViews, MapValue,
     ObservationLevel, ObservationsView, PaginatedDatasetItems, PaginatedDatasetRuns,
     PaginatedDatasets, Prompt, PromptMetaListResponse, ScoreDataType, Trace, TraceBody,
     TraceWithDetails, TraceWithFullDetails, Traces,

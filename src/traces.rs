@@ -4,11 +4,46 @@ use bon::bon;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use uuid::Uuid;
 
 use crate::client::LangfuseClient;
 use crate::error::{Error, Result};
+
+/// Token counts for a generation, serialized as Langfuse `usageDetails`.
+///
+/// Langfuse aggregates this into prompt, completion, and total token counts
+/// on the generation observation. `total` is intentionally a separate field
+/// because Langfuse stores it as its own bucket alongside `input` and `output`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenerationUsageDetails {
+    pub input: i32,
+    pub output: i32,
+    pub total: i32,
+}
+
+impl GenerationUsageDetails {
+    /// Build usage details from input/output token counts. `total` is set to
+    /// `input + output`.
+    pub fn new(input: i32, output: i32) -> Self {
+        Self {
+            input,
+            output,
+            total: input.saturating_add(output),
+        }
+    }
+}
+
+impl From<GenerationUsageDetails> for langfuse_client_base::models::UsageDetails {
+    fn from(value: GenerationUsageDetails) -> Self {
+        let mut map = HashMap::with_capacity(3);
+        map.insert("input".to_string(), value.input);
+        map.insert("output".to_string(), value.output);
+        map.insert("total".to_string(), value.total);
+        langfuse_client_base::models::UsageDetails::Object(map)
+    }
+}
 
 /// Helper trait for ergonomic tag creation
 pub trait IntoTags {
@@ -141,6 +176,7 @@ impl LangfuseClient {
         timestamp: Option<DateTime<Utc>>,
         #[builder(into)] release: Option<String>,
         #[builder(into)] version: Option<String>,
+        #[builder(into)] environment: Option<String>,
         public: Option<bool>,
     ) -> Result<TraceResponse> {
         use langfuse_client_base::models::{
@@ -165,6 +201,7 @@ impl LangfuseClient {
             .maybe_session_id(session_id.map(Some))
             .maybe_release(release.map(Some))
             .maybe_version(version.map(Some))
+            .maybe_environment(environment.map(Some))
             .maybe_metadata(metadata.map(Some))
             .maybe_tags(tags_option.map(Some))
             .maybe_public(public.map(Some))
@@ -343,6 +380,7 @@ impl LangfuseClient {
 
     /// Create a generation observation
     #[builder]
+    #[allow(clippy::too_many_arguments)]
     pub async fn generation(
         &self,
         #[builder(into)] trace_id: String,
@@ -357,10 +395,15 @@ impl LangfuseClient {
         start_time: Option<DateTime<Utc>>,
         end_time: Option<DateTime<Utc>>,
         #[builder(into)] model: Option<String>,
-        _model_parameters: Option<Value>,
-        _prompt_tokens: Option<i32>,
-        _completion_tokens: Option<i32>,
+        model_parameters: Option<HashMap<String, langfuse_client_base::models::MapValue>>,
+        prompt_tokens: Option<i32>,
+        completion_tokens: Option<i32>,
         _total_tokens: Option<i32>,
+        usage_details: Option<GenerationUsageDetails>,
+        cost_details: Option<HashMap<String, f64>>,
+        #[builder(into)] prompt_name: Option<String>,
+        prompt_version: Option<i32>,
+        #[builder(into)] environment: Option<String>,
     ) -> Result<String> {
         use langfuse_client_base::models::{
             ingestion_event_one_of_4::Type as GenerationEventType, CreateGenerationBody,
@@ -375,6 +418,18 @@ impl LangfuseClient {
         let level = level.map(|l| parse_observation_level(&l));
         let end_time_str = end_time.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
 
+        // Fall back to legacy prompt/completion token args when the caller has
+        // not supplied a full GenerationUsageDetails. Both counts must be
+        // present — partial token info doesn't map cleanly onto Langfuse's
+        // input/output/total bucket layout.
+        let usage_details = match (usage_details, prompt_tokens, completion_tokens) {
+            (Some(usage), _, _) => Some(usage),
+            (None, Some(prompt), Some(completion)) => {
+                Some(GenerationUsageDetails::new(prompt, completion))
+            }
+            _ => None,
+        };
+
         let generation_body = CreateGenerationBody::builder()
             .id(Some(observation_id.clone()))
             .trace_id(Some(trace_id))
@@ -388,6 +443,12 @@ impl LangfuseClient {
             .maybe_level(level)
             .maybe_status_message(status_message.map(Some))
             .maybe_parent_observation_id(parent_observation_id.map(Some))
+            .maybe_usage_details(usage_details.map(|u| Box::new(u.into())))
+            .maybe_cost_details(cost_details.map(Some))
+            .maybe_prompt_name(prompt_name.map(Some))
+            .maybe_prompt_version(prompt_version.map(Some))
+            .maybe_environment(environment.map(Some))
+            .maybe_model_parameters(model_parameters.map(Some))
             .build();
 
         let event = IngestionEventOneOf4::builder()
@@ -565,6 +626,7 @@ impl LangfuseClient {
 
     /// Update an existing generation
     #[builder]
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_generation(
         &self,
         #[builder(into)] id: String,
@@ -581,6 +643,12 @@ impl LangfuseClient {
         status_message: Option<String>,
         version: Option<String>,
         #[builder(into)] parent_observation_id: Option<String>,
+        usage_details: Option<GenerationUsageDetails>,
+        cost_details: Option<HashMap<String, f64>>,
+        #[builder(into)] prompt_name: Option<String>,
+        prompt_version: Option<i32>,
+        #[builder(into)] environment: Option<String>,
+        model_parameters: Option<HashMap<String, langfuse_client_base::models::MapValue>>,
     ) -> Result<String> {
         use chrono::Utc as ChronoUtc;
         use langfuse_client_base::models::{
@@ -588,8 +656,6 @@ impl LangfuseClient {
         };
         use uuid::Uuid;
 
-        // Note: In v0.2, model_parameters and usage have different types
-        // We'll leave them out for now as they require special handling
         let event_body = UpdateGenerationBody {
             id: id.clone(),
             trace_id: Some(Some(trace_id)),
@@ -598,20 +664,20 @@ impl LangfuseClient {
             end_time: Some(end_time.map(|dt| dt.to_rfc3339())),
             completion_start_time: Some(completion_start_time.map(|dt| dt.to_rfc3339())),
             model: Some(model),
-            model_parameters: None, // Requires HashMap<String, MapValue>
+            model_parameters: model_parameters.map(Some),
             input: Some(input),
             output: Some(output),
-            usage: None, // Requires Box<IngestionUsage>
+            usage: None, // Requires Box<IngestionUsage>; native usageDetails covers this path.
             metadata: Some(metadata),
             level: level.map(|l| parse_observation_level(&l)),
             status_message: Some(status_message),
             version: Some(version),
             parent_observation_id: Some(parent_observation_id),
-            environment: None,
-            cost_details: None,
-            prompt_name: None,
-            prompt_version: None,
-            usage_details: None,
+            environment: environment.map(Some),
+            cost_details: cost_details.map(Some),
+            prompt_name: prompt_name.map(Some),
+            prompt_version: prompt_version.map(Some),
+            usage_details: usage_details.map(|u| Box::new(u.into())),
         };
 
         let event = IngestionEventOneOf5 {
